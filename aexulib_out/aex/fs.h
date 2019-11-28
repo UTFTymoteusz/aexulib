@@ -34,6 +34,8 @@ typedef struct finfo finfo_t;
 bool fexists(char* path);
 int finfo(char* path, finfo_t*);
 
+void ftranslate(char* buffer, char* base, char* path);
+
 DIR* opendir(char* path);
 dentry_t* readdir(DIR*);
 void closedir(DIR*);
