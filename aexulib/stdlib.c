@@ -4,127 +4,323 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "stdio.h"
+#include "string.h"
+
 #include "stdlib.h"
 
-#define DEFAULT_BLOCK_SIZE 65536
+#define POOL_PIECE_SIZE  16
+#define DEFAULT_POOL_SIZE 1024 * 256
 
-struct block {
-    size_t size;
-    bool   free;
+#define ALLOC_DATATYPE uint32_t
 
-    struct block* next;
+struct mem_pool {
+    //mutex_t mutex;
+
+    uint32_t pieces;
+    uint32_t free_pieces;
+    uint32_t reserved_pieces;
+
+    struct mem_pool* next;
+
+    char* name;
+    void* start;
+
+    bool ignore_mutex;
+    
+    ALLOC_DATATYPE bitmap[];
 };
-typedef struct block block_t;
+typedef struct mem_pool mem_pool_t;
 
-struct pool {
-    size_t size;
-    size_t free;
+struct mem_block {
+    uint8_t wasted_size;
+    uint8_t uses;
 
-    bool releasable;
+    uint16_t cookie;
 
-    struct block* first_block;
-    struct pool* next;
+    uint32_t start_piece;
+    uint32_t pieces;
 };
-typedef struct pool pool_t;
+typedef struct mem_block mem_block_t;
 
-pool_t* first_pool = NULL;
+mem_pool_t* mem_pool0 = NULL;
+
+size_t mem_page_size;
+
+static inline size_t topg(size_t bytes) {
+    return (bytes + (mem_page_size - 1)) / mem_page_size;
+}
+static inline size_t frompg(size_t pages) {
+    return pages * mem_page_size;
+}
+
+inline size_t floor_to_alignment(size_t in) {
+    return (in / POOL_PIECE_SIZE) * POOL_PIECE_SIZE;
+}
+inline size_t ceil_to_alignment(size_t in) {
+    return ((in + (POOL_PIECE_SIZE - 1)) / POOL_PIECE_SIZE) * POOL_PIECE_SIZE;
+}
+
+mem_pool_t* pool_create(uint32_t size, char* name) {
+    mem_page_size = get_sysvar(SYSVAR_PAGESIZE);
+
+    size += (size % (POOL_PIECE_SIZE * 2));
+    size_t pieces = size / POOL_PIECE_SIZE;
+
+    size_t required_size = size + sizeof(mem_pool_t);
+
+    void* ptr = pgalloc(required_size);
+
+    size_t actual_size    = ((frompg(topg(required_size)) - sizeof(mem_pool_t)) / POOL_PIECE_SIZE) * POOL_PIECE_SIZE;
+    size_t remaining_size = floor_to_alignment(actual_size - (pieces / 8));
+
+    mem_pool_t* pool = ptr;
+
+    pool->pieces = remaining_size / POOL_PIECE_SIZE;
+    pool->free_pieces = pool->pieces;
+
+    pool->start = (void*) ceil_to_alignment(((size_t) pool + sizeof(mem_pool_t) + (pieces / 8)));
+    pool->name = name;
+
+    pool->next = NULL;
+
+    memset(&(pool->bitmap), 0, pool->pieces / 8);
+    memset(pool->start, 0, pool->pieces * POOL_PIECE_SIZE);
+
+    return pool;
+}
+
+static inline int64_t find_space(mem_pool_t* pool, size_t piece_amount) {
+    if (piece_amount == 0)
+        return -1;
+
+    size_t  combo = 0;
+    int64_t start = -1;
+    size_t remaining = pool->pieces;
+
+    int32_t current_index = 0;
+    uint16_t bit = 0;
+
+    size_t bitmap_piece = pool->bitmap[current_index];
+
+    while (remaining-- > 0) {
+        if (bit >= (sizeof(ALLOC_DATATYPE) * 8)) {
+            bitmap_piece = pool->bitmap[++current_index];
+            bit = 0;
+        }
+
+        if (((bitmap_piece >> bit) & 0b01) == 1) {
+            start = -1;
+            combo = 0;
+
+            bit++;
+            continue;
+        }
+
+        if (start == -1)
+            start = current_index * (sizeof(ALLOC_DATATYPE) * 8) + bit;
+
+        bit++;
+        combo++;
+        if (combo == piece_amount)
+            return start;
+    }
+    //printk("failed\n");
+    return -1;
+}
+
+static inline void set_pieces(mem_pool_t* pool, size_t starting_piece, size_t amount, bool occupied) {
+    if (amount == 0)
+        return;
+
+    uint32_t current_index = starting_piece / (sizeof(ALLOC_DATATYPE) * 8);
+    uint16_t bit = starting_piece % (sizeof(ALLOC_DATATYPE) * 8);
+
+    ALLOC_DATATYPE bitmap_piece = pool->bitmap[current_index];
+
+    if (occupied) {
+        while (amount-- > 0) {
+            if (bit >= (sizeof(ALLOC_DATATYPE) * 8)) {
+                pool->bitmap[current_index] = bitmap_piece;
+                bitmap_piece = pool->bitmap[++current_index];
+                bit = 0;
+            }
+            if (bitmap_piece & (1 << bit)) {
+                fprintf(stderr, "mempool: ALLOC FAILED: R: %li, CI: %i\n", amount, current_index);
+            }
+            bitmap_piece |= (1 << bit++);
+        }
+    }
+    else {
+        while (amount-- > 0) {
+            if (bit >= (sizeof(ALLOC_DATATYPE) * 8)) {
+                pool->bitmap[current_index] = bitmap_piece;
+                bitmap_piece = pool->bitmap[++current_index];
+                bit = 0;
+            }
+            if (!(bitmap_piece & (1 << bit))) {
+                fprintf(stderr, "mempool: FREE FAILED: R: %li\n", amount);
+            }
+            bitmap_piece &= ~(1 << bit++);
+        }
+    }
+    pool->bitmap[current_index] = bitmap_piece;
+}
+
+static inline size_t addr_to_piece(mem_pool_t* pool, void* addr) {
+    return ((size_t) addr - (size_t) pool->start) / POOL_PIECE_SIZE;
+}
+
+static inline mem_pool_t* find_parent(void* addr, mem_pool_t* root) {
+    mem_pool_t* current = root;
+    size_t cmp;
+    while (current != NULL) {
+        cmp = ((size_t) addr - (size_t) current->start);
+        if (cmp <= (current->pieces * POOL_PIECE_SIZE) && addr >= current->start)
+            return current;
+
+        current = current->next;
+    }
+    return NULL;
+}
+
+static inline mem_block_t* get_block_from_ext_addr(void* addr) {
+    return (mem_block_t*) (floor_to_alignment((size_t) addr) - POOL_PIECE_SIZE);
+}
+
+void verify_pools(char* id) {
+    mem_pool_t* pool = mem_pool0;
+
+    size_t  combo = 0;
+    size_t remaining = pool->pieces;
+
+    int32_t current_index = 0;
+    uint16_t bit = 0;
+
+    uint8_t* addr;
+
+    ALLOC_DATATYPE bitmap_piece = pool->bitmap[current_index];
+
+    while (remaining-- > 0) {
+        if (bit >= (sizeof(ALLOC_DATATYPE) * 8)) {
+            bitmap_piece = pool->bitmap[++current_index];
+            bit = 0;
+        }
+
+        if (((bitmap_piece >> bit) & 0b01) == 1) {
+            bit++;
+            continue;
+        }
+
+        addr = (uint8_t*) ((uint8_t*) pool->start + (current_index * (sizeof(ALLOC_DATATYPE) * 8) + bit) * POOL_PIECE_SIZE);
+        for (size_t i = 0; i < POOL_PIECE_SIZE; i++) {
+            if (addr[i] != '\0') {
+                fprintf(stderr, "mem: %s\n", id);
+            }
+        }
+        bit++;
+        combo++;
+    }
+}
 
 void* calloc(size_t nmeb, size_t size) {
     return malloc(nmeb * size);
 }
 
-void debug_enum_mblocks() {
-    pool_t* pool = first_pool;
-    block_t* block;
-
-    int pool_id = 0;
-
-    while (pool != NULL) {
-        printf("block %i:\n", pool_id);
-        block = pool->first_block;
-
-        int block_id = 0;
-        while (block != NULL) {
-            printf("pool %i; s%i - %s\n", block_id++, block->size, block->free ? "free" : "busy");
-
-            block = block->next;
-        }
-
-        pool_id++;
-        pool = pool->next;
-    }
-}
-
-pool_t* create_pool(size_t size) {
-    pool_t* pool = pgalloc(size);
-    pool->size = size - sizeof(pool_t);
-    pool->free = pool->size - sizeof(block_t);
-    pool->next = NULL;
-    pool->releasable = false;
-
-    block_t* block = (block_t*)(((size_t)pool) + sizeof(pool_t));
-    block->size = pool->free;
-    block->free = true;
-    block->next = NULL;
-
-    pool->first_block = block;
-
-    return pool;
-}
-
 void* malloc(size_t size) {
-    pool_t* pool = first_pool;
-    block_t* block = NULL;
+    if (size == 0)
+        return NULL;
 
-    if (pool == NULL) {
-        first_pool = create_pool(DEFAULT_BLOCK_SIZE);
-        pool = first_pool;
-    }
-    block = pool->first_block;
+    //size_t aa;
+    //asm volatile("mov %%rsp, %0" : : "r"(aa));
+    //printf("malloc(%i) 0x%x\n", size, aa);
 
-    size_t real_size = size + sizeof(block_t);
+    if (mem_pool0 == NULL)
+        mem_pool0 = pool_create(65536, "Root");
 
+    mem_pool_t* pool = mem_pool0;
+
+    size = ceil_to_alignment(size);
+    size_t pieces = (size / POOL_PIECE_SIZE) + (ceil_to_alignment(sizeof(mem_block_t)) / POOL_PIECE_SIZE);
+    
+    int64_t starting_piece = 0;
+
+    //mutex_acquire_yield(&(pool->mutex));
+        
     while (true) {
-        if (block == NULL) {
-            if (pool->next == NULL)
-                pool->next = create_pool((real_size > DEFAULT_BLOCK_SIZE) ? real_size + DEFAULT_BLOCK_SIZE : DEFAULT_BLOCK_SIZE);
-
-            debug_enum_mblocks();
+        if (pool->free_pieces < pieces || starting_piece == -1) {
+            if (pool->next == NULL) {
+                pool->next = pool_create((size > DEFAULT_POOL_SIZE) ? size * 2 : DEFAULT_POOL_SIZE, pool->name);
+                pool->next->ignore_mutex = pool->ignore_mutex;
+            }
+            //mutex_release(&(pool->mutex));
             pool = pool->next;
-            block = pool->first_block;
+            //mutex_acquire_yield(&(pool->mutex));
         }
-        if (!block->free) {
-            block = block->next;
+        
+        starting_piece = find_space(pool, pieces);
+        if (starting_piece == -1)
             continue;
-        }
 
-        if (block->size == size) {
-            block->free = false;
-            pool->free -= size;
-            return (void*)(((size_t)block) + sizeof(block_t));
-        }
-        else if (block->size > real_size + 32) {
-            block_t* new_block = (block_t*)((size_t)block + real_size + sizeof(block_t));
+        set_pieces(pool, starting_piece, pieces, true);
+        pool->free_pieces -= pieces;
 
-            new_block->size = block->size - real_size;
-            new_block->free = true;
-            new_block->next = block->next;
-
-            block->size = size;
-            block->free = false;
-            block->next = new_block;
-
-            pool->free -= real_size;
-
-            return (void*)(((size_t)block) + sizeof(block_t));
-        }
-        block = block->next;
+        break;
     }
+    //mutex_release(&(pool->mutex));
+
+    void* addr = (void*) ((size_t) pool->start + ((starting_piece + 1) * POOL_PIECE_SIZE));
+
+    /*uint8_t* test = (uint8_t*) get_block_from_ext_addr(addr);
+    for (size_t i = 0; i < pieces * POOL_PIECE_SIZE; i++) {
+        if (*test != 0)
+            kpanic("not blank");
+
+        test++;
+    }*/
+    mem_block_t* block = get_block_from_ext_addr(addr);
+    block->start_piece = starting_piece;
+    block->pieces = pieces - 1;
+    block->uses   = 1;
+    block->wasted_size = 0;
+    block->cookie = 0xD6A4;
+
+    return addr;
 }
 
-void free(void* ptr) {
-    block_t* block = ptr - sizeof(block_t);
-    block->free = true;
+void* realloc(void* space, size_t size) {
+    if (space == NULL) {
+        if (size == 0)
+            return NULL;
+
+        return malloc(size);
+    }
+    if (size == 0) {
+        free(space);
+        return NULL;
+    }
+    mem_block_t* block = get_block_from_ext_addr(space);
+    uint64_t oldsize   = block->pieces * POOL_PIECE_SIZE;
+
+    void* new = malloc(size);
+
+    memcpy(new, space, oldsize);
+    free(space);
+
+    return new;
+}
+
+void free(void* space) {
+    mem_block_t* block = get_block_from_ext_addr(space);
+    mem_pool_t* parent = find_parent(block, mem_pool0);
+
+    //mutex_acquire_yield(&(parent->mutex));
+
+    set_pieces(parent, addr_to_piece(parent, block), block->pieces + 1, false);
+    parent->free_pieces += block->pieces + 1;
+    memset((void*) block, 0, (block->pieces + 1) * POOL_PIECE_SIZE);
+
+    //mutex_release(&(parent->mutex));
 }
 
 void exit(int status) {

@@ -1,5 +1,10 @@
 #include "aexulib.h"
+
 #include "stdio.h"
+
+FILE* _stdin  = (FILE*)0;
+FILE* _stdout = (FILE*)1;
+FILE* _stderr = (FILE*)2;
 
 FILE* fopen(const char* filename, const char* mode) {
     long ret = syscall(SYSCALL_FOPEN, filename);

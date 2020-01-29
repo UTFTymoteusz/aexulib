@@ -6,14 +6,18 @@
 
 #define EOF (-1)
 
+// implement perror pls
+
 struct file {
     // temporary, i cant malloc() yet
 };
 typedef struct file FILE;
 
-#define stdin  (FILE*)0
-#define stdout (FILE*)1
-#define stderr (FILE*)2
+FILE* _stdin, * _stdout, * _stderr;
+
+#define stdin  _stdin
+#define stdout _stdout
+#define stderr _stderr
 
 FILE* fopen(const char* filename, const char* mode);
 size_t fread(const void* ptr, size_t size, size_t nitems, FILE* stream);

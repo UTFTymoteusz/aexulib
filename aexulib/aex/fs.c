@@ -79,3 +79,7 @@ void ftranslate(char* buffer, char* base, char* path) {
         ++out;
     }
 }
+
+long ioctl(FILE* file, long code, void* mem) {
+    syscall(SYSCALL_IOCTL, file, code, mem);
+}
